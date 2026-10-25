@@ -124,6 +124,9 @@ static void ot_br_init(void *ctx)
 
         // Stop SoftAP mode
         esp_br_wifi_config_stop();
+        
+        esp_wifi_stop();
+        esp_wifi_deinit();
 #else
         // Standard Wi-Fi connection mode - get from Kconfig
         strncpy(wifi_ssid, CONFIG_EXAMPLE_WIFI_SSID, sizeof(wifi_ssid) - 1);

@@ -24,6 +24,7 @@
 #include "esp_heap_caps.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_ota_ops.h"
 #include "esp_openthread.h"
 #include "esp_openthread_border_router.h"
 #include "esp_spiffs.h"
@@ -38,6 +39,8 @@
 #include "openthread/thread.h"
 #include "openthread/thread_ftd.h"
 
+#include "mbedtls/base64.h"
+
 #define MAX_FILE_SIZE (200 * 1024) // 200 KB
 #define MAX_FILE_SIZE_STR "200KB"
 #define SCRATCH_BUFSIZE 1024 /* Scratch buffer size */
@@ -45,6 +48,116 @@
 #define SERVER_IPV4_LEN 16
 #define FILE_CHUNK_SIZE 4096
 #define WEB_TAG "obtr_web"
+
+#include "nvs.h"
+
+#define BR_WEB_AUTH_NVS_NAMESPACE "br_web_auth"
+#define BR_WEB_AUTH_USERNAME_KEY "username"
+#define BR_WEB_AUTH_PASSWORD_KEY "password"
+#define BR_WEB_AUTH_USERNAME_MAXLEN 32
+#define BR_WEB_AUTH_PASSWORD_MAXLEN 64
+
+/* 初回起動時、NVSに何も保存されていない場合のみ使われるデフォルト値 */
+#define BR_WEB_AUTH_DEFAULT_USERNAME "admin"
+#define BR_WEB_AUTH_DEFAULT_PASSWORD "changeme"
+
+static nvs_handle_t s_web_auth_nvs_handle = 0;
+
+esp_err_t esp_br_web_auth_init(void)
+{
+    static bool s_auth_init = false;
+    if (!s_auth_init) {
+        esp_err_t err = nvs_open(BR_WEB_AUTH_NVS_NAMESPACE, NVS_READWRITE, &s_web_auth_nvs_handle);
+        ESP_RETURN_ON_ERROR(err, WEB_TAG, "Failed to open br_web_auth NVS namespace (0x%x)", err);
+        s_auth_init = true;
+    }
+    return ESP_OK;
+}
+
+esp_err_t esp_br_web_auth_set_username(const char *username)
+{
+    ESP_RETURN_ON_FALSE((s_web_auth_nvs_handle != 0), ESP_FAIL, WEB_TAG, "auth NVS handle is invalid");
+    ESP_RETURN_ON_ERROR(nvs_set_str(s_web_auth_nvs_handle, BR_WEB_AUTH_USERNAME_KEY, username), WEB_TAG,
+                        "No buffers for username");
+    ESP_RETURN_ON_ERROR(nvs_commit(s_web_auth_nvs_handle), WEB_TAG, "Failed to commit username");
+    return ESP_OK;
+}
+
+esp_err_t esp_br_web_auth_get_username(char *username, size_t maxlen)
+{
+    ESP_RETURN_ON_FALSE((s_web_auth_nvs_handle != 0), ESP_FAIL, WEB_TAG, "auth NVS handle is invalid");
+    size_t length = maxlen;
+    if (nvs_get_str(s_web_auth_nvs_handle, BR_WEB_AUTH_USERNAME_KEY, username, &length) != ESP_OK) {
+        /* 未設定なら初回起動とみなし、デフォルト値をそのままNVSにも書き込んでおく */
+        strlcpy(username, BR_WEB_AUTH_DEFAULT_USERNAME, maxlen);
+        esp_br_web_auth_set_username(username);
+    }
+    return ESP_OK;
+}
+
+esp_err_t esp_br_web_auth_set_password(const char *password)
+{
+    ESP_RETURN_ON_FALSE((s_web_auth_nvs_handle != 0), ESP_FAIL, WEB_TAG, "auth NVS handle is invalid");
+    ESP_RETURN_ON_ERROR(nvs_set_str(s_web_auth_nvs_handle, BR_WEB_AUTH_PASSWORD_KEY, password), WEB_TAG,
+                        "No buffers for password");
+    ESP_RETURN_ON_ERROR(nvs_commit(s_web_auth_nvs_handle), WEB_TAG, "Failed to commit password");
+    return ESP_OK;
+}
+
+esp_err_t esp_br_web_auth_get_password(char *password, size_t maxlen)
+{
+    ESP_RETURN_ON_FALSE((s_web_auth_nvs_handle != 0), ESP_FAIL, WEB_TAG, "auth NVS handle is invalid");
+    size_t length = maxlen;
+    if (nvs_get_str(s_web_auth_nvs_handle, BR_WEB_AUTH_PASSWORD_KEY, password, &length) != ESP_OK) {
+        strlcpy(password, BR_WEB_AUTH_DEFAULT_PASSWORD, maxlen);
+        esp_br_web_auth_set_password(password);
+    }
+    return ESP_OK;
+}
+
+/*-----------------------------------------------------
+ Note：Http Server Basic Auth
+-----------------------------------------------------*/
+static bool check_basic_auth(httpd_req_t *req)
+{
+    size_t hdr_len = httpd_req_get_hdr_value_len(req, "Authorization");
+    if (hdr_len == 0) {
+        return false;
+    }
+
+    char *auth_hdr = malloc(hdr_len + 1);
+    if (!auth_hdr) {
+        return false;
+    }
+    if (httpd_req_get_hdr_value_str(req, "Authorization", auth_hdr, hdr_len + 1) != ESP_OK) {
+        free(auth_hdr);
+        return false;
+    }
+
+    bool ok = false;
+    const char *prefix = "Basic ";
+    if (strncmp(auth_hdr, prefix, strlen(prefix)) == 0) {
+        const char *b64 = auth_hdr + strlen(prefix);
+        unsigned char decoded[128] = {0};
+        size_t decoded_len = 0;
+        if (mbedtls_base64_decode(decoded, sizeof(decoded) - 1, &decoded_len, (const unsigned char *)b64,
+                                  strlen(b64)) == 0) {
+            decoded[decoded_len] = '\0';
+            char stored_username[BR_WEB_AUTH_USERNAME_MAXLEN] = {0};
+            char stored_password[BR_WEB_AUTH_PASSWORD_MAXLEN] = {0};
+            esp_br_web_auth_get_username(stored_username, sizeof(stored_username));
+            esp_br_web_auth_get_password(stored_password, sizeof(stored_password));
+
+            char expected[BR_WEB_AUTH_USERNAME_MAXLEN + BR_WEB_AUTH_PASSWORD_MAXLEN + 1];
+            snprintf(expected, sizeof(expected), "%s:%s", stored_username, stored_password);
+            ok = (strcmp((char *)decoded, expected) == 0);
+        }
+    }
+
+    free(auth_hdr);
+    return ok;
+}
+
 
 /*-----------------------------------------------------
  Note：Http Server
@@ -72,11 +185,11 @@ static http_server_t s_server = {NULL, {"", ""}, "", 80}; /* the instance of ser
 /**
  * @brief The basic parameter definition for parsing url
  */
-#define PROTLOCOL_MAX_SIZE 12
+#define PROTOCOL_MAX_SIZE 12
 #define FILENAME_MAX_SIZE 64
 #define FILEPATH_MAX_SIZE (FILENAME_MAX_SIZE + ESP_VFS_PATH_MAX)
 typedef struct request_url {
-    char protocol[PROTLOCOL_MAX_SIZE];
+    char protocol[PROTOCOL_MAX_SIZE];
     uint16_t port;
     char file_name[FILENAME_MAX_SIZE];
     char file_path[FILEPATH_MAX_SIZE];
@@ -223,6 +336,8 @@ static esp_err_t esp_otbr_ping_post_handler(httpd_req_t *req);
 static esp_err_t esp_otbr_ipaddr_get_handler(httpd_req_t *req);
 static esp_err_t esp_otbr_add_ipaddr_post_handler(httpd_req_t *req);
 static esp_err_t esp_otbr_delete_ipaddr_post_handler(httpd_req_t *req);
+static esp_err_t esp_otbr_ota_post_handler(httpd_req_t *req);
+static esp_err_t esp_otbr_auth_credentials_put_handler(httpd_req_t *req);
 
 static httpd_uri_t s_web_gui_handlers[] = {
     {
@@ -303,7 +418,55 @@ static httpd_uri_t s_web_gui_handlers[] = {
         .handler = esp_otbr_delete_ipaddr_post_handler,
         .user_ctx = &s_server.data,
     },
+    {
+        .uri = "/api/credentials",
+        .method = HTTP_PUT,
+        .handler = esp_otbr_auth_credentials_put_handler,
+        .user_ctx = &s_server.data,
+    },
+    {
+        .uri = "/api/ota",
+        .method = HTTP_POST,
+        .handler = esp_otbr_ota_post_handler,
+        .user_ctx = NULL,
+    },
 };
+
+/*-----------------------------------------------------
+ Note：Http Server Basic Auth (wrapper)
+-----------------------------------------------------*/
+static esp_err_t send_401_unauthorized(httpd_req_t *req)
+{
+    httpd_resp_set_status(req, "401 Unauthorized");
+    httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"ESP Thread BR\"");
+    httpd_resp_send(req, NULL, 0);
+    return ESP_FAIL;
+}
+
+typedef struct {
+    esp_err_t (*orig_handler)(httpd_req_t *req);
+    void *orig_user_ctx;
+    bool wrapped;
+} auth_wrapped_ctx_t;
+
+/* s_resource_handlers / s_web_gui_handlers はこの直前で既に定義済みなので sizeof が使える */
+static auth_wrapped_ctx_t s_resource_handler_ctx[sizeof(s_resource_handlers) / sizeof(httpd_uri_t)];
+static auth_wrapped_ctx_t s_web_gui_handler_ctx[sizeof(s_web_gui_handlers) / sizeof(httpd_uri_t)];
+static auth_wrapped_ctx_t s_default_uri_ctx;
+
+static esp_err_t auth_wrapper_handler(httpd_req_t *req)
+{
+    auth_wrapped_ctx_t *ctx = (auth_wrapped_ctx_t *)req->user_ctx;
+
+    if (!check_basic_auth(req)) {
+        return send_401_unauthorized(req);
+    }
+
+    req->user_ctx = ctx->orig_user_ctx;
+    esp_err_t ret = ctx->orig_handler(req);
+    req->user_ctx = ctx;
+    return ret;
+}
 
 /*-----------------------------------------------------
  Note：Http Tools
@@ -338,10 +501,17 @@ static cJSON *resource_status(char *error, char *msg)
     return root;
 }
 
-static esp_err_t httpd_server_register_http_uri(const http_server_t *server, httpd_uri_t *uris, uint8_t size)
+static esp_err_t httpd_server_register_http_uri(const http_server_t *server, httpd_uri_t *uris, auth_wrapped_ctx_t *ctx_storage, uint8_t size)
 {
     ESP_RETURN_ON_FALSE((server->handle && uris), ESP_ERR_INVALID_ARG, WEB_TAG, "Invalid argument");
     for (int i = 0; i < size; i++) {
+        if (!ctx_storage[i].wrapped) {
+            ctx_storage[i].orig_handler = uris[i].handler;
+            ctx_storage[i].orig_user_ctx = uris[i].user_ctx;
+            ctx_storage[i].wrapped = true;
+        }
+        uris[i].handler = auth_wrapper_handler;
+        uris[i].user_ctx = &ctx_storage[i];
         ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server->handle, &uris[i]), WEB_TAG,
                             "Failed to register %s for %d", uris[i].uri, i);
     }
@@ -1066,12 +1236,292 @@ exit:
     return ret;
 }
 
+static esp_err_t esp_otbr_auth_credentials_put_handler(httpd_req_t *req)
+{
+    esp_err_t ret = ESP_OK;
+    cJSON *request = httpd_request_convert2_json(req, cJSON_Object);
+    ESP_RETURN_ON_FALSE(request, ESP_FAIL, WEB_TAG, "Failed to parse credentials request");
+
+    cJSON *username = cJSON_GetObjectItem(request, "username");
+    cJSON *password = cJSON_GetObjectItem(request, "password");
+
+    bool ok = true;
+    if (cJSON_IsString(username) && strlen(username->valuestring) > 0 &&
+        strlen(username->valuestring) < BR_WEB_AUTH_USERNAME_MAXLEN) {
+        ok = ok && (esp_br_web_auth_set_username(username->valuestring) == ESP_OK);
+    }
+    if (cJSON_IsString(password) && strlen(password->valuestring) > 0 &&
+        strlen(password->valuestring) < BR_WEB_AUTH_PASSWORD_MAXLEN) {
+        ok = ok && (esp_br_web_auth_set_password(password->valuestring) == ESP_OK);
+    }
+
+    cJSON *error = cJSON_CreateNumber(ok ? 0 : 1);
+    cJSON *result = cJSON_CreateString(ok ? "successful" : "failed");
+    cJSON *message = cJSON_CreateString(ok ? "Credentials updated" : "Failed to update credentials");
+    cJSON *response = pack_response(error, result, message);
+    ESP_GOTO_ON_ERROR(httpd_send_packet(req, response), exit, WEB_TAG, "Failed to respond %s", req->uri);
+exit:
+    cJSON_Delete(request);
+    cJSON_Delete(response);
+    return ret;
+}
+
+static esp_err_t esp_otbr_ota_post_handler(httpd_req_t *req)
+{
+    esp_err_t ret = ESP_OK;
+    esp_ota_handle_t ota_handle = 0;
+    const esp_partition_t *update_partition = NULL;
+    bool ota_started = false;
+
+    if (req == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (req->content_len <= 0) {
+        httpd_resp_send_err(
+            req,
+            HTTPD_400_BAD_REQUEST,
+            "Invalid firmware size"
+        );
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    ESP_LOGI(
+        WEB_TAG,
+        "OTA upload started: %d bytes",
+        req->content_len
+    );
+
+    /*
+     * Select the OTA partition that is not currently running.
+     */
+    update_partition = esp_ota_get_next_update_partition(NULL);
+
+    if (update_partition == NULL) {
+        ESP_LOGE(
+            WEB_TAG,
+            "No OTA partition available"
+        );
+
+        httpd_resp_send_err(
+            req,
+            HTTPD_500_INTERNAL_SERVER_ERROR,
+            "No OTA partition available"
+        );
+
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    ESP_LOGI(
+        WEB_TAG,
+        "OTA target: %s @ 0x%" PRIx32 ", size=%" PRIu32,
+        update_partition->label,
+        update_partition->address,
+        update_partition->size
+    );
+
+    /*
+     * Make sure the uploaded firmware fits in the OTA partition.
+     *
+     * Your partition table gives ota_0 and ota_1 4 MiB each.
+     */
+    if ((uint32_t)req->content_len > update_partition->size) {
+        ESP_LOGE(
+            WEB_TAG,
+            "Firmware too large: %d > %" PRIu32,
+            req->content_len,
+            update_partition->size
+        );
+
+        httpd_resp_send_err(
+            req,
+            HTTPD_400_BAD_REQUEST,
+            "Firmware image is too large"
+        );
+
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    /*
+     * Start OTA.
+     */
+    ret = esp_ota_begin(
+        update_partition,
+        OTA_WITH_SEQUENTIAL_WRITES,
+        &ota_handle
+    );
+
+    if (ret != ESP_OK) {
+        ESP_LOGE(
+            WEB_TAG,
+            "esp_ota_begin failed: %s",
+            esp_err_to_name(ret)
+        );
+
+        httpd_resp_send_err(
+            req,
+            HTTPD_500_INTERNAL_SERVER_ERROR,
+            "Failed to start OTA"
+        );
+
+        return ret;
+    }
+
+    ota_started = true;
+
+    char buffer[FILE_CHUNK_SIZE];
+    int remaining = req->content_len;
+
+    while (remaining > 0) {
+
+        int recv_size = remaining;
+
+        if (recv_size > (int)sizeof(buffer)) {
+            recv_size = sizeof(buffer);
+        }
+
+        int recv_len = httpd_req_recv(
+            req,
+            buffer,
+            recv_size
+        );
+
+        if (recv_len == HTTPD_SOCK_ERR_TIMEOUT) {
+            continue;
+        }
+
+        if (recv_len <= 0) {
+            ESP_LOGE(
+                WEB_TAG,
+                "Failed to receive firmware data: %d",
+                recv_len
+            );
+
+            ret = ESP_FAIL;
+            goto ota_error;
+        }
+
+        ret = esp_ota_write(
+            ota_handle,
+            buffer,
+            recv_len
+        );
+
+        if (ret != ESP_OK) {
+            ESP_LOGE(
+                WEB_TAG,
+                "esp_ota_write failed: %s",
+                esp_err_to_name(ret)
+            );
+
+            goto ota_error;
+        }
+
+        remaining -= recv_len;
+
+        ESP_LOGD(
+            WEB_TAG,
+            "OTA progress: %d / %d",
+            req->content_len - remaining,
+            req->content_len
+        );
+    }
+
+    /*
+     * Finish and validate the OTA image.
+     */
+    ret = esp_ota_end(ota_handle);
+
+    ota_started = false;
+
+    if (ret != ESP_OK) {
+        ESP_LOGE(
+            WEB_TAG,
+            "esp_ota_end failed: %s",
+            esp_err_to_name(ret)
+        );
+
+        httpd_resp_send_err(
+            req,
+            HTTPD_400_BAD_REQUEST,
+            "Invalid firmware image"
+        );
+
+        return ret;
+    }
+
+    /*
+     * Select the new firmware as the next boot partition.
+     */
+    ret = esp_ota_set_boot_partition(update_partition);
+
+    if (ret != ESP_OK) {
+        ESP_LOGE(
+            WEB_TAG,
+            "Failed to set boot partition: %s",
+            esp_err_to_name(ret)
+        );
+
+        httpd_resp_send_err(
+            req,
+            HTTPD_500_INTERNAL_SERVER_ERROR,
+            "Failed to set boot partition"
+        );
+
+        return ret;
+    }
+
+    ESP_LOGI(
+        WEB_TAG,
+        "OTA successful. Boot partition: %s",
+        update_partition->label
+    );
+
+    /*
+     * Send the HTTP response before restarting.
+     */
+    httpd_resp_set_type(
+        req,
+        "application/json"
+    );
+
+    ret = httpd_resp_sendstr(
+        req,
+        "{\"error\":0,\"message\":\"OTA successful. Rebooting...\"}"
+    );
+
+    /*
+     * Give the HTTP response some time to reach the browser.
+     */
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    esp_restart();
+
+    return ret;
+
+
+ota_error:
+
+    if (ota_started) {
+        esp_ota_abort(ota_handle);
+    }
+
+    httpd_resp_send_err(
+        req,
+        HTTPD_500_INTERNAL_SERVER_ERROR,
+        "OTA failed"
+    );
+
+    return ret;
+}
+
 /*-----------------------------------------------------
  Note：Handling for Client request
 -----------------------------------------------------*/
 static esp_err_t NOT_FOUND_handler(httpd_req_t *req)
 {
     esp_err_t ret = ESP_OK;
+    httpd_resp_set_status(req, HTTPD_404);
     cJSON *response = resource_status("404", "404 Not Found");
     ESP_GOTO_ON_ERROR(httpd_send_packet(req, response), exit, WEB_TAG, "Failed to response %s", req->uri);
 
@@ -1190,7 +1640,7 @@ static request_url_t parse_request_url_information(const char *uri, const struct
         .file_path = "",
     };
     ret.port = parse_url->port;
-    if ((parse_url->field_set & (1 << UF_SCHEMA)) != 0 && PROTLOCOL_MAX_SIZE > parse_url->field_data[UF_SCHEMA].len) {
+    if ((parse_url->field_set & (1 << UF_SCHEMA)) != 0 && PROTOCOL_MAX_SIZE > parse_url->field_data[UF_SCHEMA].len) {
         memcpy(ret.protocol, uri + parse_url->field_data[UF_SCHEMA].off, parse_url->field_data[UF_SCHEMA].len);
         ret.protocol[parse_url->field_data[UF_SCHEMA].len] = '\0';
     }
@@ -1332,11 +1782,18 @@ static httpd_handle_t *start_esp_br_http_server(const char *base_path, const cha
 
     httpd_uri_t default_uris_get = {.uri = "/*", // Match all URIs of type /path/to/file
                                     .method = HTTP_GET,
-                                    .handler = default_urls_get_handler,
-                                    .user_ctx = &s_server.data};
+                                    .handler = auth_wrapper_handler,
+                                    .user_ctx = &s_default_uri_ctx};
+    if (!s_default_uri_ctx.wrapped) {
+        s_default_uri_ctx.orig_handler = default_urls_get_handler;
+        s_default_uri_ctx.orig_user_ctx = &s_server.data;
+        s_default_uri_ctx.wrapped = true;
+    }
 
-    httpd_server_register_http_uri(&s_server, s_resource_handlers, sizeof(s_resource_handlers) / sizeof(httpd_uri_t));
-    httpd_server_register_http_uri(&s_server, s_web_gui_handlers, sizeof(s_web_gui_handlers) / sizeof(httpd_uri_t));
+    httpd_server_register_http_uri(&s_server, s_resource_handlers, s_resource_handler_ctx,
+                                   sizeof(s_resource_handlers) / sizeof(httpd_uri_t));
+    httpd_server_register_http_uri(&s_server, s_web_gui_handlers, s_web_gui_handler_ctx,
+                                   sizeof(s_web_gui_handlers) / sizeof(httpd_uri_t));
     httpd_register_uri_handler(s_server.handle, &default_uris_get);
 
     // Show the login address in the console
@@ -1404,6 +1861,7 @@ static void handler_got_ip_event(void *arg, esp_event_base_t event_base, int32_t
 
 void esp_br_web_start(char *base_path)
 {
+    esp_br_web_auth_init();  /* Enabled to load user credentials from NVS */
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &handler_got_ip_event, base_path));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &handler_got_ip_event, base_path));
 }

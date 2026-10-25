@@ -303,6 +303,7 @@ void handle_ot_resource_node_set_dataset_request(const cJSON *request, cJSON *lo
     otOperationalDatasetTlvs datasetTlvs;
     otOperationalDatasetTlvs datasetUpdateTlvs;
     otError ret = OT_ERROR_NONE;
+    memset(&dataset, 0, sizeof(otOperationalDataset));
     const char *content_format =
         cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(request, ESP_OT_REST_CONTENT_TYPE_HEADER));
     const char *dataset_type =

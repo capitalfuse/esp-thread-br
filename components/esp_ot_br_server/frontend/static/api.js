@@ -40,6 +40,15 @@ function apiPost(url, data) {
       .then(function(r) { return r.json(); });
 }
 
+function apiPut(url, data) {
+  return fetch(url, {
+           method : 'PUT',
+           headers : {'Content-Type' : 'application/json'},
+           body : JSON.stringify(data)
+         })
+      .then(function(r) { return r.json(); });
+}
+
 /**
  * Get cached response for a GET endpoint, or null if not available.
  * Use this to render immediately on page load before the live fetch completes.
@@ -137,7 +146,9 @@ var pages = [
       {href : '/network.html', label : 'Network'},
       {href : '/commission.html', label : 'Commissioner'},
       {href : '/addresses.html', label : 'Addresses'},
-      {href : '/tools.html', label : 'Tools'}
+      {href : '/tools.html', label : 'Tools'},
+      {href : '/ota.html', label : 'Firmware Update'},
+      {href : '/credentials.html', label : 'Change Credentials'}
     ]
   },
   {href : '/topology.html', label : 'Topology'},

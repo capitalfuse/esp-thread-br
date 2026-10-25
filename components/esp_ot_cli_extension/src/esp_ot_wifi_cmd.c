@@ -89,6 +89,12 @@ static nvs_handle_t s_wifi_config_nvs_handle = 0;
 #define PASSWORDMAXLEN 64
 ESP_EVENT_DEFINE_BASE(WIFI_ADDRESS_EVENT);
 
+/* ---- Wi-Fi reconnect watchdog ---- */
+static TaskHandle_t s_wifi_watchdog_task_handle = NULL;
+
+/* wifi_watchdog_task より前方で使うための前方宣言 */
+static esp_err_t wifi_join(const char *ssid, const char *password);
+
 static void handle_wifi_addr_init(void)
 {
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_ADDRESS_EVENT, WIFI_ADDRESS_EVENT_ADD_IP6,
@@ -105,6 +111,36 @@ static void handle_wifi_addr_init(void)
                                                esp_netif_get_handle_from_ifkey("WIFI_STA_DEF")));
 }
 
+/*
+ * ウォッチドッグタスク本体。
+ * wifi_join() はブロッキング呼び出しのため、WIFI_EVENT_STA_DISCONNECTED の
+ * イベントハンドラ(handler_on_wifi_disconnect)から直接呼ばず、
+ * ここ(独立タスク)に処理を委譲することでイベントループタスクを長時間占有しないようにする。
+ */
+static void wifi_watchdog_task(void *arg)
+{
+    for (;;) {
+        /* handler_on_wifi_disconnect からの通知を待つ */
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        char ssid[SSIDMAXLEN] = "";
+        char password[PASSWORDMAXLEN] = "";
+        esp_ot_wifi_config_get_ssid(ssid);
+        esp_ot_wifi_config_get_password(password);
+
+        if (strlen(ssid) == 0) {
+            /* 保存された設定がなければ何もしない */
+            continue;
+        }
+
+        ESP_LOGW(OT_EXT_CLI_TAG, "example_connect gave up, immediately retrying rejoin to \"%s\"", ssid);
+        esp_err_t err = wifi_join(ssid, password);
+        if (err != ESP_OK) {
+            ESP_LOGW(OT_EXT_CLI_TAG, "Watchdog rejoin attempt failed (0x%x), will retry on next disconnect cycle", err);
+        }
+    }
+}
+
 static void handler_on_wifi_disconnect(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
     wifi_conn_retry_nums++;
@@ -112,6 +148,10 @@ static void handler_on_wifi_disconnect(void *arg, esp_event_base_t event_base, i
     if (wifi_conn_retry_nums > CONFIG_EXAMPLE_WIFI_CONN_MAX_RETRY) {
         wifi_conn_retry_nums = 0;
         s_wifi_state = OT_WIFI_DISCONNECTED;
+        /* example_connect が諦めたと同時に、間を置かず自前で再接続を試みる */
+        if (s_wifi_watchdog_task_handle != NULL) {
+            xTaskNotifyGive(s_wifi_watchdog_task_handle);
+        }
     } else
 #endif
     {
@@ -193,6 +233,16 @@ esp_err_t esp_ot_wifi_connect(const char *ssid, const char *password)
         ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MAX_MODEM));
         handle_wifi_addr_init();
         s_wifi_initialized = true;
+
+        /* ウォッチドッグ用タイマーとタスクは初回接続時に一度だけ生成する */
+        if (s_wifi_watchdog_task_handle == NULL) {
+            BaseType_t ok = xTaskCreate(wifi_watchdog_task, "wifi_watchdog", 4096, NULL,
+                                        tskIDLE_PRIORITY + 3, &s_wifi_watchdog_task_handle);
+            if (ok != pdPASS) {
+                ESP_LOGE(OT_EXT_CLI_TAG, "Failed to create wifi watchdog task");
+                s_wifi_watchdog_task_handle = NULL;
+            }
+        }
     }
 
     if (!s_wifi_handler_registered) {

@@ -1,8 +1,8 @@
 ## IDF Component Manager Manifest File
 dependencies:
   espressif/mdns: "^1.0.0"
-  espressif/esp_ot_cli_extension:
-    version: "~2.0.0"
+  esp_ot_cli_extension:
+    path: ../../../components/esp_ot_cli_extension
   espressif/esp_rcp_update:
     version: "~1.6.0"
   esp_br_http_ota:

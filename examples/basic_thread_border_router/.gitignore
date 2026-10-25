@@ -1,0 +1,6 @@
+.pio
+.vscode
+build_log.txt
+*.code-workspace
+build
+managed_components
